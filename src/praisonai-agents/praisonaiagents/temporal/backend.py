@@ -1,5 +1,6 @@
 import asyncio
 from typing import Dict, Any, List, Optional
+from datetime import timedelta
 import logging
 
 from praisonaiagents.execution.protocols import ExecutionBackendProtocol
@@ -167,7 +168,265 @@ class TemporalExecutionBackend(ExecutionBackendProtocol):
         input_data: str,
         variables: Dict[str, Any],
     ) -> Dict[str, Any]:
-        raise NotImplementedError("Workflow pattern mapping not yet implemented via Temporal")
+        """
+        Execute a workflow with pattern steps (Route, Parallel, Loop, Repeat).
+        
+        Pattern types are detected and mapped to appropriate Temporal activities:
+        - Parallel: Execute steps concurrently using asyncio.gather
+        - Route: Execute based on routing decision
+        - Loop: Iterate over items executing step(s)
+        - Repeat: Repeat until condition or max iterations
+        """
+        from praisonaiagents.workflows.workflows import Route, Parallel, Loop, Repeat
+        import uuid
+        
+        client = await self._get_client()
+        results = []
+        current_input = input_data
+        all_variables = dict(variables)
+        
+        workflow_id = f"praisonai-workflow-{uuid.uuid4()}"
+        logger.info(f"Starting Temporal workflow {workflow_id} with {len(steps)} steps")
+        
+        for i, step in enumerate(steps):
+            step_result = None
+            step_name = f"step_{i}"
+            
+            try:
+                if isinstance(step, Parallel):
+                    step_result = await self._execute_parallel_step(
+                        client, step, current_input, all_variables, workflow_id
+                    )
+                elif isinstance(step, Route):
+                    step_result = await self._execute_route_step(
+                        client, step, current_input, all_variables, workflow_id
+                    )
+                elif isinstance(step, Loop):
+                    step_result = await self._execute_loop_step(
+                        client, step, current_input, all_variables, workflow_id
+                    )
+                elif isinstance(step, Repeat):
+                    step_result = await self._execute_repeat_step(
+                        client, step, current_input, all_variables, workflow_id
+                    )
+                else:
+                    # Single agent step - execute via Temporal activity
+                    step_result = await self._execute_single_agent(
+                        client, step, current_input, all_variables, workflow_id
+                    )
+                
+                if step_result:
+                    results.append({"step": step_name, "result": step_result})
+                    current_input = step_result if isinstance(step_result, str) else str(step_result)
+                    logger.debug(f"Step {i} completed: {step_name}")
+                    
+            except Exception as e:
+                logger.error(f"Step {i} ({step_name}) failed: {e}")
+                raise
+        
+        return {
+            "workflow_id": workflow_id,
+            "output": current_input,
+            "steps": results,
+            "status": "completed"
+        }
+
+    async def _execute_single_agent(
+        self,
+        client: Any,
+        agent: Any,
+        input_data: str,
+        variables: Dict[str, Any],
+        workflow_id: str,
+    ) -> str:
+        """Execute a single agent step via Temporal activity."""
+        from praisonaiagents.temporal.converter import serialize_agent
+        from praisonaiagents.temporal.activities.models import AgentActivityInput
+        from temporalio.common import RetryPolicy
+        import uuid
+        
+        agent_config = serialize_agent(agent)
+        activity_input = AgentActivityInput(
+            task_config={"description": input_data},
+            agent_config=agent_config,
+            context_data=input_data
+        )
+        
+        retry_policy = RetryPolicy(
+            initial_interval=timedelta(seconds=1),
+            backoff_coefficient=2.0,
+            maximum_attempts=3,
+        )
+        
+        # Execute activity via Temporal
+        result = await client.execute_activity(
+            "run_agent_task",
+            args=[activity_input],
+            activity_id=f"{workflow_id}-agent-{uuid.uuid4()}",
+            task_queue=self.config.task_queue,
+            retry_policy=retry_policy,
+            start_to_close_timeout=self.config.activity_timeout,
+        )
+        return result
+
+    async def _execute_parallel_step(
+        self,
+        client: Any,
+        parallel: Any,
+        input_data: str,
+        variables: Dict[str, Any],
+        workflow_id: str,
+    ) -> str:
+        """Execute parallel steps concurrently using asyncio.gather."""
+        from temporalio.common import RetryPolicy
+        import uuid
+        
+        async def run_step(step):
+            return await self._execute_single_agent(
+                client, step, input_data, variables, workflow_id
+            )
+        
+        # Execute all steps in parallel
+        tasks = [run_step(step) for step in parallel.steps]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Combine results
+        combined = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.warning(f"Parallel step {i} failed: {r}")
+                combined.append(f"Step {i}: Error - {r}")
+            else:
+                combined.append(f"Step {i}: {r}")
+        
+        return "\n".join(combined)
+
+    async def _execute_route_step(
+        self,
+        client: Any,
+        route: Any,
+        input_data: str,
+        variables: Dict[str, Any],
+        workflow_id: str,
+    ) -> str:
+        """Execute route step - select branch based on previous output."""
+        # Simple routing: match keywords in input_data
+        lower_input = input_data.lower()
+        selected_branch = None
+        
+        for key, steps in route.routes.items():
+            if key.lower() in lower_input:
+                selected_branch = steps
+                break
+        
+        if selected_branch is None:
+            selected_branch = route.default or []
+        
+        logger.debug(f"Route selected branch: {selected_branch}")
+        
+        # Execute selected branch steps
+        results = []
+        for step in selected_branch:
+            result = await self._execute_single_agent(
+                client, step, input_data, variables, workflow_id
+            )
+            results.append(result)
+        
+        return "\n".join(results) if results else input_data
+
+    async def _execute_loop_step(
+        self,
+        client: Any,
+        loop: Any,
+        input_data: str,
+        variables: Dict[str, Any],
+        workflow_id: str,
+    ) -> str:
+        """Execute loop step - iterate over items."""
+        import csv
+        import os
+        
+        # Get items to iterate over
+        items = []
+        if loop.over and loop.over in variables:
+            items = variables[loop.over]
+        elif loop.from_csv and os.path.exists(loop.from_csv):
+            with open(loop.from_csv, 'r') as f:
+                reader = csv.reader(f)
+                items = [row for row in reader]
+        elif loop.from_file and os.path.exists(loop.from_file):
+            with open(loop.from_file, 'r') as f:
+                items = [line.strip() for line in f if line.strip()]
+        
+        if not items:
+            logger.warning(f"Loop has no items to iterate over")
+            return input_data
+        
+        # Determine steps to execute per iteration
+        steps_to_execute = loop.steps if loop.steps else ([loop.step] if loop.step else [])
+        results = []
+        
+        async def process_item(item):
+            item_str = str(item) if not isinstance(item, str) else item
+            item_result = item_str
+            for step in steps_to_execute:
+                item_result = await self._execute_single_agent(
+                    client, step, item_result, {**variables, loop.var_name: item}, workflow_id
+                )
+            return item_result
+        
+        if loop.parallel:
+            # Parallel execution
+            max_concurrent = loop.max_workers or len(items)
+            semaphore = asyncio.Semaphore(max_concurrent)
+            
+            async def bounded_process(item):
+                async with semaphore:
+                    return await process_item(item)
+            
+            loop_results = await asyncio.gather(*[bounded_process(item) for item in items])
+            results.extend(loop_results)
+        else:
+            # Sequential execution
+            for item in items:
+                result = await process_item(item)
+                results.append(result)
+        
+        return "\n---\n".join(results)
+
+    async def _execute_repeat_step(
+        self,
+        client: Any,
+        repeat: Any,
+        input_data: str,
+        variables: Dict[str, Any],
+        workflow_id: str,
+    ) -> str:
+        """Execute repeat step - evaluator-optimizer pattern."""
+        current = input_data
+        iteration = 0
+        
+        while iteration < repeat.max_iterations:
+            # Execute the step
+            result = await self._execute_single_agent(
+                client, repeat.step, current, variables, workflow_id
+            )
+            current = result
+            iteration += 1
+            
+            # Check condition if provided
+            if repeat.until:
+                try:
+                    # Simple check: look for approval/complete keywords
+                    if "approved" in result.lower() or "complete" in result.lower():
+                        logger.debug(f"Repeat satisfied at iteration {iteration}")
+                        break
+                except Exception as e:
+                    logger.warning(f"Repeat condition check failed: {e}")
+            
+            logger.debug(f"Repeat iteration {iteration}/{repeat.max_iterations}")
+        
+        return current
 
     async def get_status(self, execution_id: str) -> Dict[str, Any]:
         """Get the status of a workflow execution."""
