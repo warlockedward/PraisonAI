@@ -91,4 +91,5 @@ issue_details.json
 target/
 Cargo.lock
 **/*.rs.bk
-*.pdb
+*.pdb.sisyphus/
+.sisyphus/*

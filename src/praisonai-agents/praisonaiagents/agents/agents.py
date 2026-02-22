@@ -301,14 +301,26 @@ class AgentTeam:
         # Resolve EXECUTION param using canonical resolver
         # Supports: None, str preset, list [preset, overrides], Config, dict
         # ─────────────────────────────────────────────────────────────────────
-        _exec_config = resolve(
-            value=execution,
-            param_name="execution",
-            config_class=MultiAgentExecutionConfig,
-            presets=MULTI_AGENT_EXECUTION_PRESETS,
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=MultiAgentExecutionConfig() if MultiAgentExecutionConfig else None,
-        )
+        # Store raw execution param for backend dispatch
+        self._execution_backend_config = execution
+
+        # Check if execution is specifying a backend instead of a preset
+        _is_backend_str = isinstance(execution, str) and execution in ("local", "temporal")
+        _is_backend_obj = type(execution).__name__ == "TemporalConfig"
+        
+        if _is_backend_str or _is_backend_obj:
+            # Skip resolving presets for max_iter if execution is a backend
+            _exec_config = MultiAgentExecutionConfig() if MultiAgentExecutionConfig else None
+        else:
+            _exec_config = resolve(
+                value=execution,
+                param_name="execution",
+                config_class=MultiAgentExecutionConfig,
+                presets=MULTI_AGENT_EXECUTION_PRESETS,
+                array_mode=ArrayMode.PRESET_OVERRIDE,
+                default=MultiAgentExecutionConfig() if MultiAgentExecutionConfig else None,
+            )
+        
         if _exec_config and hasattr(_exec_config, 'max_iter'):
             _max_iter = _exec_config.max_iter
             _max_retries = _exec_config.max_retries
@@ -898,7 +910,14 @@ Context:
                         task.context = []
                     task.context.append(content)
 
-        await self.arun_all_tasks()
+        from ..execution.registry import get_backend
+        backend = get_backend(self._execution_backend_config)
+        await backend.execute_team(
+            agents=self.agents,
+            tasks=self.tasks,
+            process_mode=self.process,
+            config={"team": self, "verbose": getattr(self, "verbose", False)}
+        )
         
         # Get results
         results = {
@@ -1248,6 +1267,11 @@ Context:
             result = agents.start(output="silent")
             ```
         """
+        # Defer to async start if using non-local execution backend
+        if hasattr(self, '_execution_backend_config') and self._execution_backend_config not in (None, "local"):
+            import asyncio
+            return asyncio.run(self.astart(content=content, return_dict=return_dict, **kwargs))
+
         # Track execution via telemetry
         if hasattr(self, '_telemetry') and self._telemetry:
             self._telemetry.track_agent_execution(self.name, success=True)

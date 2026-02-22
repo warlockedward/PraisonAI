@@ -1,0 +1,178 @@
+version: '3.8'
+
+services:
+  temporal:
+    image: temporalio/server:latest
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+      - NUM_HISTORY_SHARDS=512
+      - HISTORY_SHARD_DISTRIBUTION_MODE=0
+      - LIMIT_MAX_CONCURRENT_WORKFLOW_EXECUTION_SIZE=100000
+      - LIMIT_MAX_CONCURRENT_ACTIVITY_EXECUTION_SIZE=100000
+      - LIMIT_MAX_CONCURRENT_ACTIVITY_TASK_QUEUE_POLLERS=1000
+      - LIMIT_MAX_CONCURRENT_WORKFLOW_TASK_QUEUE_POLLERS=1000
+      - DYNAMIC_CONFIG_CLIENT_BACKEND=redis
+      - DYNAMIC_CONFIG_CLIENT_REDIS_HOST=redis
+      - DYNAMIC_CONFIG_CLIENT_REDIS_PORT=6379
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - temporal-network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - temporal-network
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=500"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "effective_cache_size=3GB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "default_statistics_target=100"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "min_wal_size=1GB"
+      - "-c"
+      - "max_wal_size=4GB"
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - temporal-network
+    command: redis-server --maxmemory 4gb --maxmemory-policy allkeys-lru --save 60 1000
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 2G
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+    networks:
+      - temporal-network
+
+  praisonai-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.praisonaiagents
+    command: ["python", "-m", "praisonai", "temporal", "worker"]
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=praisonai-agents
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
+      - WORKER_MAX_CONCURRENT_ACTIVITIES=100
+      - WORKER_MAX_CONCURRENT_WORKFLOW_TASKS=50
+      - WORKER_MAX_TASK_QUEUE_ACTIVITIES_PER_SECOND=1000
+      - REDIS_URL=redis://redis:6379
+      - CACHE_ENABLED=true
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_REQUESTS_PER_MINUTE=1000
+    depends_on:
+      - temporal
+      - redis
+    networks:
+      - temporal-network
+    deploy:
+      replicas: 5
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  api-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.praisonaiagents
+    command: ["python", "-m", "praisonai", "serve", "--port", "8081"]
+    ports:
+      - "8081:8081"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      - REDIS_URL=redis://redis:6379
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
+      - REQUEST_QUEUE_ENABLED=true
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_REQUESTS_PER_MINUTE=5000
+    depends_on:
+      - temporal
+      - redis
+    networks:
+      - temporal-network
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  temporal-network:
+    driver: bridge

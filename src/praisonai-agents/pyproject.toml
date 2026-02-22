@@ -83,6 +83,11 @@ auth = [
     "python-multipart>=0.0.6"
 ]
 
+# Temporal workflow engine (optional backend for durable agent execution)
+temporal = [
+    "temporalio>=1.8.0"
+]
+
 # Combined features
 all = [
     "praisonaiagents[memory]",
@@ -93,7 +98,8 @@ all = [
     "praisonaiagents[api]",
     "praisonaiagents[telemetry]",
     "praisonaiagents[mongodb]",
-    "praisonaiagents[auth]"
+    "praisonaiagents[auth]",
+    "praisonaiagents[temporal]"
 ]
 
 [tool.setuptools.packages.find]
