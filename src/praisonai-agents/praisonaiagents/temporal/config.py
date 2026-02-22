@@ -32,3 +32,11 @@ class TemporalConfig:
     connect_retries: int = 3
     connect_retry_delay: timedelta = field(default_factory=lambda: timedelta(seconds=1))
     health_check_interval: timedelta = field(default_factory=lambda: timedelta(seconds=30))
+    
+    # Metrics configuration
+    enable_prometheus_metrics: bool = False
+    
+    @property
+    def activity_timeout(self) -> timedelta:
+        """Alias for default_activity_timeout for use in activity execution."""
+        return self.default_activity_timeout

@@ -18,6 +18,11 @@ class TemporalExecutionBackend(ExecutionBackendProtocol):
         self._client = None
         self._worker_task = None
         self._health_check_task = None
+        self._metrics = None
+        
+        if self.config.enable_prometheus_metrics:
+            from praisonaiagents.temporal.metrics import TemporalMetrics
+            self._metrics = TemporalMetrics(enabled=True)
 
     async def _connect_with_retry(self) -> Any:
         """Connect to Temporal server with retry logic."""
