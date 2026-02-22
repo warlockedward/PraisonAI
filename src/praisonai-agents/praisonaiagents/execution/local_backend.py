@@ -1,6 +1,8 @@
-# execution/local_backend.py
 from typing import Any, Dict, List
+import logging
 from .protocols import ExecutionBackendProtocol
+
+logger = logging.getLogger(__name__)
 
 class LocalExecutionBackend(ExecutionBackendProtocol):
     
@@ -16,7 +18,22 @@ class LocalExecutionBackend(ExecutionBackendProtocol):
             raise ValueError("LocalExecutionBackend requires 'team' in config")
         
         await team.arun_all_tasks()
-        return {}
+        
+        results = {
+            "task_status": team.get_all_tasks_status() if hasattr(team, 'get_all_tasks_status') else {},
+            "task_results": {}
+        }
+        
+        if hasattr(team, 'tasks') and hasattr(team, 'get_task_result'):
+            for task_id in team.tasks:
+                result = team.get_task_result(task_id)
+                if result:
+                    results["task_results"][task_id] = {
+                        "raw": getattr(result, 'raw', str(result)),
+                        "agent": getattr(result, 'agent', None),
+                    }
+        
+        return results
 
     async def execute_task(
         self,

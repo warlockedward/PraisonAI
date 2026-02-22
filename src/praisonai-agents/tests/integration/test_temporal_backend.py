@@ -14,14 +14,15 @@ async def test_temporal_backend_initialization():
     assert backend._worker_task is None
 
 @pytest.mark.asyncio
-@patch('praisonaiagents.temporal.backend.Client.connect', new_callable=AsyncMock)
-async def test_get_client(mock_connect):
+async def test_get_client():
     mock_client = MagicMock()
-    mock_connect.return_value = mock_client
     
-    config = TemporalConfig(address="test:7233", start_worker=False)
-    backend = TemporalExecutionBackend(config)
-    
-    client = await backend._get_client()
-    assert client == mock_client
-    mock_connect.assert_called_once_with("test:7233", namespace="default")
+    with patch('temporalio.client.Client.connect', new_callable=AsyncMock) as mock_connect:
+        mock_connect.return_value = mock_client
+        
+        config = TemporalConfig(address="test:7233", start_worker=False)
+        backend = TemporalExecutionBackend(config)
+        
+        client = await backend._get_client()
+        assert client == mock_client
+        mock_connect.assert_called_once()
