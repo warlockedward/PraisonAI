@@ -27,3 +27,8 @@ class TemporalConfig:
 
     data_converter: Optional[Any] = None
     interceptors: Optional[List[Any]] = None
+    
+    connect_timeout: timedelta = field(default_factory=lambda: timedelta(seconds=30))
+    connect_retries: int = 3
+    connect_retry_delay: timedelta = field(default_factory=lambda: timedelta(seconds=1))
+    health_check_interval: timedelta = field(default_factory=lambda: timedelta(seconds=30))
