@@ -20,7 +20,7 @@ class TeamInput:
 
 if TEMPORAL_AVAILABLE:
     with workflow.unsafe.imports_passed_through():
-        from praisonaiagents.temporal.activities.models import AgentActivityInput
+        from praisonaiagents.temporal.activities.models import AgentActivityInput, ManagerDecisionInput
         from praisonaiagents import TaskOutput
 
     @workflow.defn
@@ -159,7 +159,112 @@ if TEMPORAL_AVAILABLE:
             }
             
         async def _run_hierarchical(self, input_data: TeamInput) -> Dict[str, Any]:
-            raise NotImplementedError("Hierarchical process mode not yet implemented for Temporal backend")
+            from datetime import timedelta
+            from temporalio.common import RetryPolicy
+            
+            results = {}
+            task_status = {}
+            
+            for task_id, task_config in input_data.tasks_config.items():
+                task_status[task_id] = {
+                    "name": task_config.get("name", task_id),
+                    "description": task_config.get("description", ""),
+                    "status": "not started",
+                    "agent_name": task_config.get("agent_name", "")
+                }
+            
+            max_iterations = len(input_data.tasks_config) * 3
+            iteration = 0
+            
+            while iteration < max_iterations:
+                iteration += 1
+                
+                pending_tasks = [
+                    tid for tid, tinfo in task_status.items()
+                    if tinfo["status"] != "completed"
+                ]
+                
+                if not pending_tasks:
+                    break
+                
+                manager_input = ManagerDecisionInput(
+                    tasks_status=task_status,
+                    agents_config=input_data.agents_config,
+                    manager_llm=input_data.config.get("manager_llm"),
+                    manager_config=input_data.config.get("manager_config")
+                )
+                
+                decision = await workflow.execute_activity(
+                    "manager_decide_next_task",
+                    manager_input,
+                    schedule_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        initial_interval=timedelta(seconds=2),
+                    )
+                )
+                
+                action = decision.get("action", "stop")
+                
+                if action == "stop":
+                    break
+                
+                selected_task_id = decision.get("task_id", "")
+                selected_agent_name = decision.get("agent_name", "")
+                
+                if not selected_task_id or selected_task_id not in input_data.tasks_config:
+                    continue
+                
+                if task_status[selected_task_id]["status"] == "completed":
+                    continue
+                
+                task_config = input_data.tasks_config[selected_task_id]
+                agent_config = None
+                
+                if selected_agent_name:
+                    for ac in input_data.agents_config:
+                        if ac.get("name") == selected_agent_name:
+                            agent_config = ac
+                            task_status[selected_task_id]["agent_name"] = selected_agent_name
+                            break
+                
+                if not agent_config:
+                    agent_name = task_config.get("agent_name")
+                    if agent_name:
+                        for ac in input_data.agents_config:
+                            if ac.get("name") == agent_name:
+                                agent_config = ac
+                                break
+                
+                task_status[selected_task_id]["status"] = "running"
+                
+                activity_input = AgentActivityInput(
+                    task_config=task_config,
+                    agent_config=agent_config,
+                    context_data=None
+                )
+                
+                max_retries = agent_config.get("max_retries", 3) if agent_config else 3
+                
+                result_dict = await workflow.execute_activity(
+                    "execute_agent_task",
+                    activity_input,
+                    schedule_to_close_timeout=timedelta(minutes=30),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=max_retries,
+                        initial_interval=timedelta(seconds=2),
+                        backoff_coefficient=2.0,
+                        maximum_interval=timedelta(minutes=5),
+                    )
+                )
+                
+                results[selected_task_id] = result_dict
+                task_status[selected_task_id]["status"] = "completed"
+            
+            return {
+                "task_status": task_status,
+                "task_results": results
+            }
 else:
     class AgentTeamWorkflow:
         def __init__(self, *args, **kwargs):
